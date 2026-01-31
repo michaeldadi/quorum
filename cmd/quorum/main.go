@@ -2,14 +2,13 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"quorum/internal/kv"
 	"quorum/internal/raft"
 	"quorum/pkg/logger"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -17,6 +16,7 @@ import (
 func main() {
 	nodeID := flag.String("id", "node-1", "node ID")
 	port := flag.Int("port", 9001, "RPC port")
+	httpPort := flag.Int("http", 8001, "HTTP port")
 	flag.Parse()
 
 	logger.Init(*nodeID)
@@ -45,47 +45,25 @@ func main() {
 
 	node.Start()
 
-	// Log applied commands
-	go func() {
-		for msg := range applyCh {
-			logger.Info("state machine applied", "index", msg.CommandIndex, "command", msg.Command)
-		}
-	}()
+	// KV store on top of Raft
+	store := kv.NewStore(node, applyCh)
+
+	// HTTP API
+	kv.NewHTTPServer(store, fmt.Sprintf(":%d", *httpPort))
 
 	// Status printer
 	go func() {
 		for {
-			time.Sleep(3 * time.Second)
+			time.Sleep(5 * time.Second)
 			term, state := node.GetState()
 			logger.Info("status", "term", term, "state", state)
 		}
 	}()
 
-	// Simple command input
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		fmt.Println("Enter commands (or 'quit' to exit):")
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "quit" {
-				err := syscall.Kill(syscall.Getpid(), syscall.SIGINT)
-				if err != nil {
-					return
-				}
-				return
-			}
-			if line == "" {
-				continue
-			}
-
-			index, term, isLeader := node.Submit(line)
-			if !isLeader {
-				fmt.Println("Not leader, command rejected")
-			} else {
-				fmt.Printf("Command accepted: index=%d term=%d\n", index, term)
-			}
-		}
-	}()
+	logger.Info("node ready",
+		"id", *nodeID,
+		"rpc", *port,
+		"http", *httpPort)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -94,5 +72,7 @@ func main() {
 	if err := rpcServer.Close(); err != nil {
 		logger.Error("failed to close RPC server", "err", err)
 	}
+
 	node.Stop()
+	logger.Info("shutdown complete")
 }
