@@ -3,6 +3,7 @@ package kv
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"quorum/pkg/logger"
@@ -71,8 +72,27 @@ func (s *HTTPServer) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// For linearizable reads, we'll update this later
-	value, ok := s.store.Get(key)
+	// Check for local read query param (eventual consistency)
+	local := r.URL.Query().Get("local") == "true"
+
+	var value string
+	var ok bool
+	var err error
+
+	if local {
+		value, ok = s.store.GetLocal(key)
+	} else {
+		value, ok, err = s.store.Get(key)
+		if errors.Is(err, ErrNotLeader) {
+			s.redirectToLeader(w, r)
+			return
+		}
+		if err != nil {
+			s.jsonResponse(w, http.StatusInternalServerError, Response{Error: err.Error()})
+			return
+		}
+	}
+
 	if !ok {
 		s.jsonResponse(w, http.StatusNotFound, Response{Error: "key not found"})
 		return
@@ -177,7 +197,7 @@ func (s *HTTPServer) redirectToLeader(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	redirectURL := fmt.Sprintf("https://%s%s", leaderHTTP, r.URL.Path)
+	redirectURL := fmt.Sprintf("http://%s%s", leaderHTTP, r.URL.Path)
 	if r.URL.RawQuery != "" {
 		redirectURL += "?" + r.URL.RawQuery
 	}

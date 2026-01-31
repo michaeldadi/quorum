@@ -6,6 +6,7 @@ import (
 	"quorum/internal/raft"
 	"quorum/pkg/logger"
 	"sync"
+	"time"
 )
 
 const snapshotThreshold = 100 // snapshot every 100 entries
@@ -40,6 +41,8 @@ type Result struct {
 	Ok    bool
 	Err   string
 }
+
+const readTimeout = 3 * time.Second
 
 func NewStore(node *raft.Node, applyCh chan raft.ApplyMsg) *Store {
 	s := &Store{
@@ -155,7 +158,26 @@ func (s *Store) applySnapshot(data []byte) {
 	logger.Info("restored from snapshot", "keys", len(s.data))
 }
 
-func (s *Store) Get(key string) (string, bool) {
+func (s *Store) Get(key string) (value string, ok bool, err error) {
+	// Get read index from Raft leader
+	index, ok := s.node.ReadIndex()
+	if !ok {
+		return "", false, ErrNotLeader
+	}
+
+	// Wait for that index to be applied
+	if !s.node.WaitForApply(index, readTimeout) {
+		return "", false, &OpError{msg: "read timeout"}
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	value, exists := s.data[key]
+	return value, exists, nil
+}
+
+// GetLocal Local-only read for cases where eventual consistency is ok
+func (s *Store) GetLocal(key string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	value, ok := s.data[key]

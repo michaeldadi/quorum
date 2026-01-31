@@ -61,6 +61,7 @@ func NewNode(id string, peers []string, applyCh chan ApplyMsg, persister *Persis
 		state:             Follower,
 		commitIndex:       0,
 		lastApplied:       0,
+		leaderId:          "",
 		nextIndex:         make(map[string]int),
 		matchIndex:        make(map[string]int),
 		peers:             peers,
@@ -343,4 +344,106 @@ func (n *Node) logTerm(index int) int {
 func randomElectionTimeout() time.Duration {
 	n, _ := rand.Int(rand.Reader, big.NewInt(int64(maxElectionTimeout-minElectionTimeout)))
 	return minElectionTimeout + time.Duration(n.Int64())
+}
+
+// ReadIndex returns the commit index after confirming leadership.
+// Used for linearizable reads.
+func (n *Node) ReadIndex() (int, bool) {
+	n.mu.Lock()
+	if n.state != Leader {
+		n.mu.Unlock()
+		return 0, false
+	}
+
+	// Single node cluster - no need to confirm
+	if len(n.peers) == 0 {
+		index := n.commitIndex
+		n.mu.Unlock()
+		return index, true
+	}
+
+	currentTerm := n.currentTerm
+	commitIndex := n.commitIndex
+	n.mu.Unlock()
+
+	// Send heartbeats and wait for the majority to confirm we're still leader
+	confirmed := n.confirmLeadership(currentTerm)
+	if !confirmed {
+		return 0, false
+	}
+
+	return commitIndex, true
+}
+
+func (n *Node) confirmLeadership(term int) bool {
+	responses := make(chan bool, len(n.peers))
+
+	n.mu.Lock()
+	if n.state != Leader || n.currentTerm != term {
+		n.mu.Unlock()
+		return false
+	}
+
+	args := &AppendEntriesArgs{
+		Term:         n.currentTerm,
+		LeaderId:     n.id,
+		PrevLogIndex: n.lastIncludedIndex + len(n.log),
+		PrevLogTerm:  n.logTerm(n.lastIncludedIndex + len(n.log)),
+		Entries:      nil,
+		LeaderCommit: n.commitIndex,
+	}
+	peers := n.peers
+	n.mu.Unlock()
+
+	for _, peer := range peers {
+		go func(peer string) {
+			reply, ok := n.sendAppendEntries(peer, args)
+			if ok && reply.Success {
+				responses <- true
+			} else {
+				responses <- false
+			}
+		}(peer)
+	}
+
+	// Wait for a majority (including self)
+	needed := (len(peers)+1)/2 + 1
+	confirmed := 1 // count self
+	failed := 0
+	timeout := time.After(100 * time.Millisecond)
+
+	for confirmed < needed && failed <= len(peers)/2 {
+		select {
+		case success := <-responses:
+			if success {
+				confirmed++
+			} else {
+				failed++
+			}
+		case <-timeout:
+			return false
+		}
+	}
+
+	// Verify we're still leader with same term
+	n.mu.Lock()
+	stillLeader := n.state == Leader && n.currentTerm == term
+	n.mu.Unlock()
+
+	return stillLeader && confirmed >= needed
+}
+
+// WaitForApply blocks until the given index has been applied to the state machine
+func (n *Node) WaitForApply(index int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		n.mu.Lock()
+		if n.lastApplied >= index {
+			n.mu.Unlock()
+			return true
+		}
+		n.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
 }
