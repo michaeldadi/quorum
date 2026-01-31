@@ -38,11 +38,14 @@ type Node struct {
 	// Channels
 	resetElection chan struct{}
 	stopCh        chan struct{}
-	applyCh       chan ApplyMsg // committed entries go here
+	applyCh       chan ApplyMsg
+
+	// Persistence
+	persister *Persister
 }
 
-func NewNode(id string, peers []string, applyCh chan ApplyMsg) *Node {
-	return &Node{
+func NewNode(id string, peers []string, applyCh chan ApplyMsg, persister *Persister) *Node {
+	n := &Node{
 		id:            id,
 		currentTerm:   0,
 		votedFor:      "",
@@ -56,17 +59,54 @@ func NewNode(id string, peers []string, applyCh chan ApplyMsg) *Node {
 		resetElection: make(chan struct{}),
 		stopCh:        make(chan struct{}),
 		applyCh:       applyCh,
+		persister:     persister,
 	}
+
+	// Load persisted state if any
+	if persister != nil {
+		state, err := persister.Load()
+		if err != nil {
+			logger.Error("failed to load persisted state", "err", err)
+		} else {
+			n.currentTerm = state.CurrentTerm
+			n.votedFor = state.VotedFor
+			n.log = state.Log
+			n.commitIndex = len(n.log)
+		}
+	}
+
+	return n
 }
 
 func (n *Node) Start() {
-	logger.Info("node starting", "id", n.id, "peers", n.peers)
+	logger.Info("node starting",
+		"id", n.id,
+		"peers", n.peers,
+		"term", n.currentTerm,
+		"logLen", len(n.log))
+
 	go n.electionLoop()
 	go n.applyLoop()
 }
 
 func (n *Node) Stop() {
 	close(n.stopCh)
+}
+
+func (n *Node) persist() {
+	if n.persister == nil {
+		return
+	}
+
+	state := PersistedState{
+		CurrentTerm: n.currentTerm,
+		VotedFor:    n.votedFor,
+		Log:         n.log,
+	}
+
+	if err := n.persister.Save(state); err != nil {
+		logger.Error("failed to persist state", "err", err)
+	}
 }
 
 func (n *Node) electionLoop() {
@@ -84,7 +124,6 @@ func (n *Node) electionLoop() {
 			}
 
 		case <-n.resetElection:
-			// Reset timer, continue loop
 
 		case <-n.stopCh:
 			logger.Info("election loop stopping")
@@ -93,7 +132,6 @@ func (n *Node) electionLoop() {
 	}
 }
 
-// applyLoop sends committed entries to the state machine
 func (n *Node) applyLoop() {
 	for {
 		select {
@@ -105,7 +143,7 @@ func (n *Node) applyLoop() {
 		n.mu.Lock()
 		for n.commitIndex > n.lastApplied {
 			n.lastApplied++
-			entry := n.log[n.lastApplied-1] // log is 0-indexed, entries are 1-indexed
+			entry := n.log[n.lastApplied-1]
 
 			msg := ApplyMsg{
 				CommandValid: true,
@@ -125,7 +163,6 @@ func (n *Node) applyLoop() {
 	}
 }
 
-// Submit a command to the leader—returns index, term, and whether this node is leader
 func (n *Node) Submit(command interface{}) (index, term int, isLeader bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -145,6 +182,7 @@ func (n *Node) Submit(command interface{}) (index, term int, isLeader bool) {
 
 	n.log = append(n.log, entry)
 	n.matchIndex[n.id] = index
+	n.persist()
 
 	logger.Info("leader accepted command", "index", index, "term", term)
 
@@ -155,7 +193,6 @@ func (n *Node) becomeLeader() {
 	n.state = Leader
 	logger.Info("became leader", "term", n.currentTerm)
 
-	// Initialize leader state (Figure 2)
 	for _, peer := range n.peers {
 		n.nextIndex[peer] = len(n.log) + 1
 		n.matchIndex[peer] = 0
@@ -169,6 +206,7 @@ func (n *Node) becomeFollower(term int) {
 	n.state = Follower
 	n.currentTerm = term
 	n.votedFor = ""
+	n.persist()
 	logger.Info("became follower", "term", n.currentTerm)
 }
 

@@ -76,6 +76,7 @@ func (s *RPCServer) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 	if (s.node.votedFor == "" || s.node.votedFor == args.CandidateId) && logOk {
 		s.node.votedFor = args.CandidateId
 		reply.VoteGranted = true
+		s.node.persist() // <-- add this
 		s.node.ResetElectionTimer()
 		logger.Info("granted vote", "to", args.CandidateId, "term", args.Term)
 	}
@@ -102,35 +103,36 @@ func (s *RPCServer) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 		s.node.becomeFollower(args.Term)
 	}
 
-	// Log consistency check (§5.3)
 	if args.PrevLogIndex > 0 {
 		if args.PrevLogIndex > len(s.node.log) {
-			// We don't have the previous entry
 			return nil
 		}
 		if s.node.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
-			// Conflicting entry, delete it and all that follow
 			s.node.log = s.node.log[:args.PrevLogIndex-1]
+			s.node.persist() // <-- add this
 			return nil
 		}
 	}
 
-	// Append new entries (§5.3)
+	modified := false
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + i + 1
 		if idx <= len(s.node.log) {
 			if s.node.log[idx-1].Term != entry.Term {
-				// Conflict—truncate and append
 				s.node.log = s.node.log[:idx-1]
 				s.node.log = append(s.node.log, entry)
+				modified = true
 			}
-			// else: already have this entry, skip
 		} else {
 			s.node.log = append(s.node.log, entry)
+			modified = true
 		}
 	}
 
-	// Update commit index
+	if modified {
+		s.node.persist() // <-- add this
+	}
+
 	if args.LeaderCommit > s.node.commitIndex {
 		lastNewIndex := args.PrevLogIndex + len(args.Entries)
 		if args.LeaderCommit < lastNewIndex {

@@ -69,6 +69,7 @@ func (n *Node) startElection() {
 	n.state = Candidate
 	n.currentTerm++
 	n.votedFor = n.id
+	n.persist()
 	currentTerm := n.currentTerm
 	lastLogIndex, lastLogTerm := n.lastLogInfo()
 	n.mu.Unlock()
