@@ -76,7 +76,7 @@ func (s *RPCServer) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 	if (s.node.votedFor == "" || s.node.votedFor == args.CandidateId) && logOk {
 		s.node.votedFor = args.CandidateId
 		reply.VoteGranted = true
-		s.node.persist() // <-- add this
+		s.node.persist()
 		s.node.ResetElectionTimer()
 		logger.Info("granted vote", "to", args.CandidateId, "term", args.Term)
 	}
@@ -103,23 +103,33 @@ func (s *RPCServer) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 		s.node.becomeFollower(args.Term)
 	}
 
+	// Log consistency check
 	if args.PrevLogIndex > 0 {
-		if args.PrevLogIndex > len(s.node.log) {
+		if args.PrevLogIndex < s.node.lastIncludedIndex {
+			// Leader is behind our snapshot, this shouldn't happen normally
+			reply.Success = true
 			return nil
 		}
-		if s.node.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
-			s.node.log = s.node.log[:args.PrevLogIndex-1]
-			s.node.persist() // <-- add this
+
+		prevLogTerm := s.node.logTerm(args.PrevLogIndex)
+		if prevLogTerm == -1 || prevLogTerm != args.PrevLogTerm {
 			return nil
 		}
 	}
 
+	// Append entries
 	modified := false
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + i + 1
-		if idx <= len(s.node.log) {
-			if s.node.log[idx-1].Term != entry.Term {
-				s.node.log = s.node.log[:idx-1]
+		logIndex := idx - s.node.lastIncludedIndex - 1
+
+		if logIndex < 0 {
+			continue // already in snapshot
+		}
+
+		if logIndex < len(s.node.log) {
+			if s.node.log[logIndex].Term != entry.Term {
+				s.node.log = s.node.log[:logIndex]
 				s.node.log = append(s.node.log, entry)
 				modified = true
 			}
@@ -130,7 +140,7 @@ func (s *RPCServer) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 	}
 
 	if modified {
-		s.node.persist() // <-- add this
+		s.node.persist()
 	}
 
 	if args.LeaderCommit > s.node.commitIndex {
@@ -144,6 +154,69 @@ func (s *RPCServer) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 	}
 
 	reply.Success = true
+	return nil
+}
+
+func (s *RPCServer) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	s.node.mu.Lock()
+	defer s.node.mu.Unlock()
+
+	reply.Term = s.node.currentTerm
+
+	if args.Term < s.node.currentTerm {
+		return nil
+	}
+
+	s.node.ResetElectionTimer()
+
+	if args.Term > s.node.currentTerm {
+		s.node.becomeFollower(args.Term)
+	}
+
+	if args.LastIncludedIndex <= s.node.lastIncludedIndex {
+		return nil // we already have a newer snapshot
+	}
+
+	logger.Info("installing snapshot",
+		"index", args.LastIncludedIndex,
+		"term", args.LastIncludedTerm)
+
+	// Discard entire log if snapshot is ahead of our log
+	lastLogIndex := s.node.lastIncludedIndex + len(s.node.log)
+	if args.LastIncludedIndex >= lastLogIndex {
+		s.node.log = make([]LogEntry, 0)
+	} else {
+		// Keep log entries after snapshot
+		logIndex := args.LastIncludedIndex - s.node.lastIncludedIndex
+		s.node.log = s.node.log[logIndex:]
+	}
+
+	s.node.lastIncludedIndex = args.LastIncludedIndex
+	s.node.lastIncludedTerm = args.LastIncludedTerm
+	s.node.snapshot = args.Data
+
+	s.node.persist()
+	if s.node.persister != nil {
+		err := s.node.persister.SaveSnapshot(args.Data)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Apply snapshot to state machine
+	if args.LastIncludedIndex > s.node.lastApplied {
+		s.node.mu.Unlock()
+		s.node.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Data,
+			SnapshotTerm:  args.LastIncludedTerm,
+			SnapshotIndex: args.LastIncludedIndex,
+		}
+		s.node.mu.Lock()
+		s.node.lastApplied = args.LastIncludedIndex
+		s.node.commitIndex = args.LastIncludedIndex
+	}
+
 	return nil
 }
 

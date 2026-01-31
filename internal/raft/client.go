@@ -18,7 +18,7 @@ func (n *Node) sendRequestVote(peer string, args *RequestVoteArgs) (*RequestVote
 	defer func(client *rpc.Client) {
 		err := client.Close()
 		if err != nil {
-			logger.Debug("failed to close client", "peer", peer, "err", err)
+			logger.Error("failed to close client", "err", err)
 		}
 	}(client)
 
@@ -46,7 +46,7 @@ func (n *Node) sendAppendEntries(peer string, args *AppendEntriesArgs) (*AppendE
 	defer func(client *rpc.Client) {
 		err := client.Close()
 		if err != nil {
-			logger.Debug("failed to close client", "peer", peer, "err", err)
+			logger.Error("failed to close client", "err", err)
 		}
 	}(client)
 
@@ -60,6 +60,32 @@ func (n *Node) sendAppendEntries(peer string, args *AppendEntriesArgs) (*AppendE
 		}
 		return reply, true
 	case <-time.After(100 * time.Millisecond):
+		return nil, false
+	}
+}
+
+func (n *Node) sendInstallSnapshot(peer string, args *InstallSnapshotArgs) (*InstallSnapshotReply, bool) {
+	client, err := rpc.Dial("tcp", peer)
+	if err != nil {
+		return nil, false
+	}
+	defer func(client *rpc.Client) {
+		err := client.Close()
+		if err != nil {
+			logger.Error("failed to close client", "err", err)
+		}
+	}(client)
+
+	reply := &InstallSnapshotReply{}
+	call := client.Go("RPCServer.InstallSnapshot", args, reply, nil)
+
+	select {
+	case <-call.Done:
+		if call.Error != nil {
+			return nil, false
+		}
+		return reply, true
+	case <-time.After(500 * time.Millisecond): // longer timeout for snapshots
 		return nil, false
 	}
 }
@@ -172,18 +198,49 @@ func (n *Node) replicateTo(peer string) {
 	}
 
 	nextIdx := n.nextIndex[peer]
-	prevLogIndex := nextIdx - 1
-	prevLogTerm := 0
 
-	if prevLogIndex > 0 && prevLogIndex <= len(n.log) {
-		prevLogTerm = n.log[prevLogIndex-1].Term
+	// If nextIndex is behind our snapshot, send snapshot instead
+	if nextIdx <= n.lastIncludedIndex {
+		args := &InstallSnapshotArgs{
+			Term:              n.currentTerm,
+			LeaderId:          n.id,
+			LastIncludedIndex: n.lastIncludedIndex,
+			LastIncludedTerm:  n.lastIncludedTerm,
+			Data:              n.snapshot,
+		}
+		currentTerm := n.currentTerm
+		n.mu.Unlock()
+
+		reply, ok := n.sendInstallSnapshot(peer, args)
+		if !ok {
+			return
+		}
+
+		n.mu.Lock()
+		defer n.mu.Unlock()
+
+		if n.state != Leader || n.currentTerm != currentTerm {
+			return
+		}
+
+		if reply.Term > n.currentTerm {
+			n.becomeFollower(reply.Term)
+			return
+		}
+
+		n.nextIndex[peer] = n.lastIncludedIndex + 1
+		return
 	}
+
+	prevLogIndex := nextIdx - 1
+	prevLogTerm := n.logTerm(prevLogIndex)
 
 	// Get entries to send
 	var entries []LogEntry
-	if nextIdx <= len(n.log) {
-		entries = make([]LogEntry, len(n.log)-nextIdx+1)
-		copy(entries, n.log[nextIdx-1:])
+	logIndex := nextIdx - n.lastIncludedIndex - 1
+	if logIndex >= 0 && logIndex < len(n.log) {
+		entries = make([]LogEntry, len(n.log)-logIndex)
+		copy(entries, n.log[logIndex:])
 	}
 
 	args := &AppendEntriesArgs{
@@ -216,21 +273,17 @@ func (n *Node) replicateTo(peer string) {
 	}
 
 	if reply.Success {
-		// Update nextIndex and matchIndex
 		n.nextIndex[peer] = nextIdx + len(entries)
 		n.matchIndex[peer] = n.nextIndex[peer] - 1
-
 		n.updateCommitIndex()
 	} else if n.nextIndex[peer] > 1 {
-		// Decrement nextIndex and retry
 		n.nextIndex[peer]--
 	}
 }
 
 func (n *Node) updateCommitIndex() {
-	// Find the highest index replicated on a majority
 	matches := make([]int, 0, len(n.peers)+1)
-	matches = append(matches, len(n.log)) // leader's own match
+	matches = append(matches, n.lastIncludedIndex+len(n.log))
 
 	for _, peer := range n.peers {
 		matches = append(matches, n.matchIndex[peer])
@@ -238,12 +291,11 @@ func (n *Node) updateCommitIndex() {
 
 	sort.Sort(sort.Reverse(sort.IntSlice(matches)))
 
-	// Majority index
 	majorityIdx := matches[(len(matches)-1)/2]
 
-	// Only commit if it's from current term (Figure 8 safety)
-	if majorityIdx > n.commitIndex && majorityIdx <= len(n.log) {
-		if n.log[majorityIdx-1].Term == n.currentTerm {
+	if majorityIdx > n.commitIndex && majorityIdx > n.lastIncludedIndex {
+		logIndex := majorityIdx - n.lastIncludedIndex - 1
+		if logIndex >= 0 && logIndex < len(n.log) && n.log[logIndex].Term == n.currentTerm {
 			logger.Info("updating commit index", "from", n.commitIndex, "to", majorityIdx)
 			n.commitIndex = majorityIdx
 		}

@@ -8,6 +8,8 @@ import (
 	"sync"
 )
 
+const snapshotThreshold = 100 // snapshot every 100 entries
+
 type OpType string
 
 const (
@@ -27,9 +29,10 @@ type Store struct {
 	data map[string]string
 	node *raft.Node
 
-	// Track pending operations waiting for commit
-	pending   map[int]chan Result
-	pendingMu sync.Mutex
+	pending      map[int]chan Result
+	pendingMu    sync.Mutex
+	lastApplied  int
+	appliedSince int // entries applied since last snapshot
 }
 
 type Result struct {
@@ -52,6 +55,13 @@ func NewStore(node *raft.Node, applyCh chan raft.ApplyMsg) *Store {
 
 func (s *Store) applyLoop(applyCh chan raft.ApplyMsg) {
 	for msg := range applyCh {
+		if msg.SnapshotValid {
+			s.applySnapshot(msg.Snapshot)
+			s.lastApplied = msg.SnapshotIndex
+			s.appliedSince = 0
+			continue
+		}
+
 		if !msg.CommandValid {
 			continue
 		}
@@ -71,20 +81,25 @@ func (s *Store) applyLoop(applyCh chan raft.ApplyMsg) {
 		}
 
 		result := s.apply(cmd)
+		s.lastApplied = msg.CommandIndex
+		s.appliedSince++
 
 		logger.Info("applied command",
 			"index", msg.CommandIndex,
 			"op", cmd.Op,
-			"key", cmd.Key,
-			"value", cmd.Value)
+			"key", cmd.Key)
 
-		// Notify waiting client if any
 		s.pendingMu.Lock()
 		if ch, ok := s.pending[msg.CommandIndex]; ok {
 			ch <- result
 			delete(s.pending, msg.CommandIndex)
 		}
 		s.pendingMu.Unlock()
+
+		// Check if we should be taking a snapshot
+		if s.appliedSince >= snapshotThreshold {
+			s.maybeSnapshot()
+		}
 	}
 }
 
@@ -111,9 +126,36 @@ func (s *Store) apply(cmd Command) Result {
 	}
 }
 
+func (s *Store) maybeSnapshot() {
+	s.mu.RLock()
+	data, err := json.Marshal(s.data)
+	lastApplied := s.lastApplied
+	s.mu.RUnlock()
+
+	if err != nil {
+		logger.Error("failed to marshal snapshot", "err", err)
+		return
+	}
+
+	s.node.Snapshot(lastApplied, data)
+	s.appliedSince = 0
+}
+
+func (s *Store) applySnapshot(data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var newData map[string]string
+	if err := json.Unmarshal(data, &newData); err != nil {
+		logger.Error("failed to unmarshal snapshot", "err", err)
+		return
+	}
+
+	s.data = newData
+	logger.Info("restored from snapshot", "keys", len(s.data))
+}
+
 func (s *Store) Get(key string) (string, bool) {
-	// For linearizable reads, we'd need to go through Raft
-	// For now, do a local read (eventually consistent)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	value, ok := s.data[key]
@@ -139,7 +181,6 @@ func (s *Store) submit(cmd Command) error {
 		return ErrNotLeader
 	}
 
-	// Wait for commit
 	ch := make(chan Result, 1)
 	s.pendingMu.Lock()
 	s.pending[index] = ch

@@ -1,30 +1,43 @@
 // Package raft raft/rpc.go
 package raft
 
-// RequestVoteArgs RequestVote RPC (Figure 2 in the paper)
+// RequestVoteArgs RequestVote RPC
 type RequestVoteArgs struct {
-	Term         int    // candidate's term
-	CandidateId  string // candidate requesting vote
-	LastLogIndex int    // index of candidate's last log entry
-	LastLogTerm  int    // term of candidate's last log entry
+	Term         int
+	CandidateId  string
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 type RequestVoteReply struct {
-	Term        int  // currentTerm, for a candidate to update itself
-	VoteGranted bool // true means a candidate received a vote
+	Term        int
+	VoteGranted bool
 }
 
-// AppendEntriesArgs AppendEntries RPC (Figure 2 in the paper)
+// AppendEntriesArgs AppendEntries RPC
 type AppendEntriesArgs struct {
-	Term         int        // leader's term
-	LeaderId     string     // so followers can redirect clients
-	PrevLogIndex int        // index of log entry immediately preceding new ones
-	PrevLogTerm  int        // term of prevLogIndex entry
-	Entries      []LogEntry // log entries to store (empty for heartbeat)
-	LeaderCommit int        // leader's commitIndex
+	Term         int
+	LeaderId     string
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
-	Term    int  // currentTerm, for leader to update itself
-	Success bool // true if the follower contained entry matching prevLogIndex and prevLogTerm
+	Term    int
+	Success bool
+}
+
+// InstallSnapshotArgs InstallSnapshot RPC
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          string
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
 }
