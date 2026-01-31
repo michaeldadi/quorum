@@ -1,4 +1,4 @@
-# quorum
+# Quorum
 
 [![CI](https://github.com/michaeldadi/quorum/actions/workflows/ci.yml/badge.svg)](https://github.com/michaeldadi/quorum/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/michaeldadi/quorum)](https://goreportcard.com/report/github.com/michaeldadi/quorum)
