@@ -2,7 +2,13 @@
 package raft
 
 type LogEntry struct {
-	Term    int         // term when leader received entry
-	Index   int         // position in the log
-	Command interface{} // state machine command
+	Term    int
+	Index   int
+	Command interface{}
+}
+
+type ApplyMsg struct {
+	CommandValid bool
+	Command      interface{}
+	CommandIndex int
 }

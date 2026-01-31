@@ -4,6 +4,7 @@ package raft
 import (
 	"net/rpc"
 	"quorum/pkg/logger"
+	"sort"
 	"sync"
 	"time"
 )
@@ -74,7 +75,7 @@ func (n *Node) startElection() {
 
 	logger.Info("starting election", "term", currentTerm)
 
-	votes := 1 // vote for self
+	votes := 1
 	var voteMu sync.Mutex
 	done := make(chan struct{})
 
@@ -95,7 +96,6 @@ func (n *Node) startElection() {
 			n.mu.Lock()
 			defer n.mu.Unlock()
 
-			// Check if we're still a candidate in the same term
 			if n.state != Candidate || n.currentTerm != currentTerm {
 				return
 			}
@@ -119,17 +119,14 @@ func (n *Node) startElection() {
 		}(peer)
 	}
 
-	// Wait for majority or timeout
 	select {
 	case <-done:
 		n.mu.Lock()
 		if n.state == Candidate && n.currentTerm == currentTerm {
 			n.becomeLeader()
-			go n.heartbeatLoop()
 		}
 		n.mu.Unlock()
 	case <-time.After(100 * time.Millisecond):
-		// Election timeout, will retry in electionLoop
 	}
 }
 
@@ -145,10 +142,9 @@ func (n *Node) heartbeatLoop() {
 				n.mu.Unlock()
 				return
 			}
-			currentTerm := n.currentTerm
 			n.mu.Unlock()
 
-			n.sendHeartbeats(currentTerm)
+			n.replicateToAll()
 
 		case <-n.stopCh:
 			return
@@ -156,29 +152,99 @@ func (n *Node) heartbeatLoop() {
 	}
 }
 
-func (n *Node) sendHeartbeats(term int) {
-	args := &AppendEntriesArgs{
-		Term:         term,
-		LeaderId:     n.id,
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
-		Entries:      nil,
-		LeaderCommit: n.commitIndex,
+func (n *Node) replicateToAll() {
+	n.mu.Lock()
+	peers := n.peers
+	n.mu.Unlock()
+
+	for _, peer := range peers {
+		go n.replicateTo(peer)
+	}
+}
+
+func (n *Node) replicateTo(peer string) {
+	n.mu.Lock()
+
+	if n.state != Leader {
+		n.mu.Unlock()
+		return
 	}
 
+	nextIdx := n.nextIndex[peer]
+	prevLogIndex := nextIdx - 1
+	prevLogTerm := 0
+
+	if prevLogIndex > 0 && prevLogIndex <= len(n.log) {
+		prevLogTerm = n.log[prevLogIndex-1].Term
+	}
+
+	// Get entries to send
+	var entries []LogEntry
+	if nextIdx <= len(n.log) {
+		entries = make([]LogEntry, len(n.log)-nextIdx+1)
+		copy(entries, n.log[nextIdx-1:])
+	}
+
+	args := &AppendEntriesArgs{
+		Term:         n.currentTerm,
+		LeaderId:     n.id,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: n.commitIndex,
+	}
+	currentTerm := n.currentTerm
+
+	n.mu.Unlock()
+
+	reply, ok := n.sendAppendEntries(peer, args)
+	if !ok {
+		return
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state != Leader || n.currentTerm != currentTerm {
+		return
+	}
+
+	if reply.Term > n.currentTerm {
+		n.becomeFollower(reply.Term)
+		return
+	}
+
+	if reply.Success {
+		// Update nextIndex and matchIndex
+		n.nextIndex[peer] = nextIdx + len(entries)
+		n.matchIndex[peer] = n.nextIndex[peer] - 1
+
+		n.updateCommitIndex()
+	} else if n.nextIndex[peer] > 1 {
+		// Decrement nextIndex and retry
+		n.nextIndex[peer]--
+	}
+}
+
+func (n *Node) updateCommitIndex() {
+	// Find the highest index replicated on a majority
+	matches := make([]int, 0, len(n.peers)+1)
+	matches = append(matches, len(n.log)) // leader's own match
+
 	for _, peer := range n.peers {
-		go func(peer string) {
-			reply, ok := n.sendAppendEntries(peer, args)
-			if !ok {
-				return
-			}
+		matches = append(matches, n.matchIndex[peer])
+	}
 
-			n.mu.Lock()
-			defer n.mu.Unlock()
+	sort.Sort(sort.Reverse(sort.IntSlice(matches)))
 
-			if reply.Term > n.currentTerm {
-				n.becomeFollower(reply.Term)
-			}
-		}(peer)
+	// Majority index
+	majorityIdx := matches[(len(matches)-1)/2]
+
+	// Only commit if it's from current term (Figure 8 safety)
+	if majorityIdx > n.commitIndex && majorityIdx <= len(n.log) {
+		if n.log[majorityIdx-1].Term == n.currentTerm {
+			logger.Info("updating commit index", "from", n.commitIndex, "to", majorityIdx)
+			n.commitIndex = majorityIdx
+		}
 	}
 }

@@ -51,7 +51,6 @@ func (s *RPCServer) Close() error {
 	return s.listener.Close()
 }
 
-// RequestVote RPC handler
 func (s *RPCServer) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
 	s.node.mu.Lock()
 	defer s.node.mu.Unlock()
@@ -64,17 +63,14 @@ func (s *RPCServer) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 	reply.Term = s.node.currentTerm
 	reply.VoteGranted = false
 
-	// Reply false if term < currentTerm (§5.1)
 	if args.Term < s.node.currentTerm {
 		return nil
 	}
 
-	// If RPC request contains term > currentTerm, convert to follower (§5.1)
 	if args.Term > s.node.currentTerm {
 		s.node.becomeFollower(args.Term)
 	}
 
-	// If votedFor is null or candidateId, and candidate's log is at least as up-to-date as receiver's log, grant vote (§5.2, §5.4)
 	logOk := s.isLogUpToDate(args.LastLogIndex, args.LastLogTerm)
 
 	if (s.node.votedFor == "" || s.node.votedFor == args.CandidateId) && logOk {
@@ -87,7 +83,6 @@ func (s *RPCServer) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 	return nil
 }
 
-// AppendEntries RPC handler (heartbeats for now)
 func (s *RPCServer) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
 	s.node.mu.Lock()
 	defer s.node.mu.Unlock()
@@ -95,20 +90,55 @@ func (s *RPCServer) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 	reply.Term = s.node.currentTerm
 	reply.Success = false
 
-	// Reply false if term < currentTerm (§5.1)
 	if args.Term < s.node.currentTerm {
 		return nil
 	}
 
-	// Valid leader, reset election timer
 	s.node.ResetElectionTimer()
 
-	// If RPC request contains term > currentTerm, convert to follower
 	if args.Term > s.node.currentTerm {
 		s.node.becomeFollower(args.Term)
 	} else if s.node.state == Candidate {
-		// Candidate discovers current leader
 		s.node.becomeFollower(args.Term)
+	}
+
+	// Log consistency check (§5.3)
+	if args.PrevLogIndex > 0 {
+		if args.PrevLogIndex > len(s.node.log) {
+			// We don't have the previous entry
+			return nil
+		}
+		if s.node.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+			// Conflicting entry, delete it and all that follow
+			s.node.log = s.node.log[:args.PrevLogIndex-1]
+			return nil
+		}
+	}
+
+	// Append new entries (§5.3)
+	for i, entry := range args.Entries {
+		idx := args.PrevLogIndex + i + 1
+		if idx <= len(s.node.log) {
+			if s.node.log[idx-1].Term != entry.Term {
+				// Conflict—truncate and append
+				s.node.log = s.node.log[:idx-1]
+				s.node.log = append(s.node.log, entry)
+			}
+			// else: already have this entry, skip
+		} else {
+			s.node.log = append(s.node.log, entry)
+		}
+	}
+
+	// Update commit index
+	if args.LeaderCommit > s.node.commitIndex {
+		lastNewIndex := args.PrevLogIndex + len(args.Entries)
+		if args.LeaderCommit < lastNewIndex {
+			s.node.commitIndex = args.LeaderCommit
+		} else {
+			s.node.commitIndex = lastNewIndex
+		}
+		logger.Debug("updated commit index", "commitIndex", s.node.commitIndex)
 	}
 
 	reply.Success = true
@@ -118,7 +148,6 @@ func (s *RPCServer) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 func (s *RPCServer) isLogUpToDate(lastLogIndex, lastLogTerm int) bool {
 	myLastIndex, myLastTerm := s.node.lastLogInfo()
 
-	// §5.4.1: Compare terms first, then index
 	if lastLogTerm != myLastTerm {
 		return lastLogTerm > myLastTerm
 	}
