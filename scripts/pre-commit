@@ -10,7 +10,7 @@ if ! golangci-lint run; then
 fi
 
 echo "Running tests..."
-if ! go test -race ./...; then
+if ! go test -race -short ./...; then
   echo "Tests failed"
   exit 1
 fi

@@ -1,4 +1,4 @@
-.PHONY: build run test lint fmt clean test-race test-cover
+.PHONY: build run test lint fmt clean test-race test-cover test-chaos
 
 BINARY=bin/quorum
 
@@ -9,14 +9,17 @@ run: build
 	./$(BINARY)
 
 test:
-	go test -v ./...
+	go test -v -short ./...
 
 test-race:
-	go test -v -race ./...
+	go test -v -race -short ./...
 
 test-cover:
-	go test -v -race -coverprofile=coverage.out ./...
+	go test -v -race -short -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
+
+test-chaos:
+	go test -v -race -timeout 5m ./internal/chaos/
 
 lint:
 	golangci-lint run
