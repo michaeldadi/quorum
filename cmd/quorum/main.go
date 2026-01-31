@@ -2,42 +2,61 @@
 package main
 
 import (
+	"flag"
 	"fmt"
-	"sync"
+	"os"
+	"os/signal"
+	"quorum/internal/raft"
+	"quorum/pkg/logger"
+	"syscall"
+	"time"
 )
 
-type Counter struct {
-	mu    sync.Mutex
-	value int
-}
-
-func (c *Counter) Increment() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.value++
-}
-
-func (c *Counter) Value() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.value
-}
-
 func main() {
-	counter := &Counter{}
-	var wg sync.WaitGroup
+	nodeID := flag.String("id", "node-1", "node ID")
+	port := flag.Int("port", 9001, "RPC port")
+	flag.Parse()
 
-	// Spawn 100 goroutines that each increment 1000 times
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				counter.Increment()
-			}
-		}()
+	logger.Init(*nodeID)
+
+	// Hardcoded 3-node cluster for now
+	allNodes := map[string]int{
+		"node-1": 9001,
+		"node-2": 9002,
+		"node-3": 9003,
 	}
 
-	wg.Wait()
-	fmt.Printf("Final count: %d (expected: 100000)\n", counter.Value())
+	var peers []string
+	for id, p := range allNodes {
+		if id != *nodeID {
+			peers = append(peers, fmt.Sprintf("localhost:%d", p))
+		}
+	}
+
+	node := raft.NewNode(*nodeID, peers)
+
+	rpcServer, err := raft.NewRPCServer(node, *port)
+	if err != nil {
+		logger.Error("failed to start RPC server", "err", err)
+		os.Exit(1)
+	}
+
+	node.Start()
+
+	go func() {
+		for {
+			time.Sleep(2 * time.Second)
+			term, state := node.GetState()
+			logger.Info("status", "term", term, "state", state)
+		}
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+
+	if err := rpcServer.Close(); err != nil {
+		logger.Error("failed to close RPC server", "err", err)
+	}
+	node.Stop()
 }

@@ -4,15 +4,13 @@ echo "Running fmt..."
 gofmt -s -w .
 
 echo "Running lint..."
-golangci-lint run
-if [ $? -ne 0 ]; then
+if ! golangci-lint run; then
   echo "Lint failed"
   exit 1
 fi
 
 echo "Running tests..."
-go test -race ./...
-if [ $? -ne 0 ]; then
+if ! go test -race ./...; then
   echo "Tests failed"
   exit 1
 fi
