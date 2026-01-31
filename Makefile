@@ -1,4 +1,4 @@
-.PHONY: build run test lint fmt clean
+.PHONY: build run test lint fmt clean test-race test-cover
 
 BINARY=bin/quorum
 
@@ -9,7 +9,14 @@ run: build
 	./$(BINARY)
 
 test:
-	go test -v -race -cover ./...
+	go test -v ./...
+
+test-race:
+	go test -v -race ./...
+
+test-cover:
+	go test -v -race -coverprofile=coverage.out ./...
+	go tool cover -html=coverage.out -o coverage.html
 
 lint:
 	golangci-lint run
@@ -19,9 +26,11 @@ fmt:
 	go mod tidy
 
 clean:
-	rm -rf bin/
+	rm -rf bin/ data/ coverage.out coverage.html
 	go clean -testcache
 
-# Run a 3-node cluster locally (we'll use this later)
 cluster:
-	@echo "TODO: start 3-node local cluster"
+	@echo "Starting 3-node cluster..."
+	@go run ./cmd/quorum --id=node-1 --port=9001 --http=8001 &
+	@go run ./cmd/quorum --id=node-2 --port=9002 --http=8002 &
+	@go run ./cmd/quorum --id=node-3 --port=9003 --http=8003 &

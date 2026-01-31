@@ -2,6 +2,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/rpc"
@@ -9,14 +10,16 @@ import (
 )
 
 type RPCServer struct {
-	node     *Node
-	listener net.Listener
+	node      *Node
+	listener  net.Listener
+	rpcServer *rpc.Server
 }
 
 func NewRPCServer(node *Node, port int) (*RPCServer, error) {
-	server := &RPCServer{node: node}
+	rpcSrv := rpc.NewServer()
+	server := &RPCServer{node: node, rpcServer: rpcSrv}
 
-	err := rpc.Register(server)
+	err := rpcSrv.Register(server)
 	if err != nil {
 		return nil, err
 	}
@@ -31,6 +34,9 @@ func NewRPCServer(node *Node, port int) (*RPCServer, error) {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
 				select {
 				case <-node.stopCh:
 					return
@@ -39,7 +45,7 @@ func NewRPCServer(node *Node, port int) (*RPCServer, error) {
 					continue
 				}
 			}
-			go rpc.ServeConn(conn)
+			go rpcSrv.ServeConn(conn)
 		}
 	}()
 
@@ -49,6 +55,14 @@ func NewRPCServer(node *Node, port int) (*RPCServer, error) {
 
 func (s *RPCServer) Close() error {
 	return s.listener.Close()
+}
+
+func (s *RPCServer) Addr() net.Addr {
+	return s.listener.Addr()
+}
+
+func (s *RPCServer) SetNode(node *Node) {
+	s.node = node
 }
 
 func (s *RPCServer) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {

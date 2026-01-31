@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-var Log *slog.Logger
+var Log = slog.Default()
 
 func Init(nodeID string) {
 	Log = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{

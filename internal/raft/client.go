@@ -103,8 +103,14 @@ func (n *Node) startElection() {
 	logger.Info("starting election", "term", currentTerm)
 
 	votes := 1
+	majority := (len(n.peers)+1)/2 + 1
 	var voteMu sync.Mutex
-	done := make(chan struct{})
+	done := make(chan struct{}, 1)
+
+	// Check if we already have majority (single-node cluster)
+	if votes >= majority {
+		done <- struct{}{}
+	}
 
 	args := &RequestVoteArgs{
 		Term:         currentTerm,
@@ -135,7 +141,7 @@ func (n *Node) startElection() {
 			if reply.VoteGranted {
 				voteMu.Lock()
 				votes++
-				if votes > (len(n.peers)+1)/2 {
+				if votes >= majority {
 					select {
 					case done <- struct{}{}:
 					default:
